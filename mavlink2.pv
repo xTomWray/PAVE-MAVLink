@@ -1,0 +1,85 @@
+(* MAVLink 2 Protocol - Basic Model *)
+
+(* Communication channel *)
+free c: channel.
+
+(* MAVLink 2 message types *)
+type system_id.
+type component_id.
+type sequence_num.
+type payload.
+type timestamp.
+
+(* Message constructors with MAVLink 2 timestamp *)
+fun heartbeat_msg(system_id, component_id, sequence_num, timestamp): bitstring [data].
+fun command_msg(system_id, component_id, sequence_num, payload, timestamp): bitstring [data].
+fun status_msg(system_id, component_id, sequence_num, payload, timestamp): bitstring [data].
+
+(* System identifiers *)
+const drone_sys: system_id [data].
+const gcs_sys: system_id [data].
+const drone_comp: component_id [data].
+const gcs_comp: component_id [data].
+
+(* Command payloads *)
+const arm_cmd: payload [data].
+const disarm_cmd: payload [data].
+const land_cmd: payload [data].
+
+(* Sequence numbers *)
+const seq1, seq2, seq3: sequence_num [data].
+
+(* Timestamps *)
+const time1, time2, time3, time4: timestamp [data].
+
+(* Timestamp generation function *)
+fun get_current_time(): timestamp.
+
+(* Events for security analysis *)
+event DroneArmed().
+event DroneDisarmed().
+event CommandReceived(system_id, payload).
+event MaliciousCommand(payload).
+
+(* Security queries *)
+query event(DroneArmed()).
+query event(MaliciousCommand(land_cmd)).
+
+(* Ground Control Station process *)
+let gcs() =
+    (* Send heartbeat with timestamp *)
+    out(c, heartbeat_msg(gcs_sys, gcs_comp, seq1, time1));
+    
+    (* Send arm command with timestamp *)
+    out(c, command_msg(gcs_sys, gcs_comp, seq2, arm_cmd, time2));
+    0.
+
+(* Drone process *)
+let drone() =
+    (* Receive and process messages *)
+    in(c, msg: bitstring);
+    (
+        (* Handle heartbeat with timestamp *)
+        let heartbeat_msg(src_sys, src_comp, seq, ts) = msg in
+        out(c, status_msg(drone_sys, drone_comp, seq1, arm_cmd, time3))
+    ) |
+    (
+        (* Handle commands with timestamp *)
+        let command_msg(src_sys, src_comp, seq, cmd, ts) = msg in
+        event CommandReceived(src_sys, cmd);
+        if cmd = arm_cmd then
+            event DroneArmed()
+        else if cmd = disarm_cmd then
+            event DroneDisarmed()
+    ).
+
+(* Adversary process *)
+let adversary() =
+    (* Inject malicious land command with forged timestamp *)
+    event MaliciousCommand(land_cmd);
+    out(c, command_msg(gcs_sys, gcs_comp, seq3, land_cmd, time4));
+    0.
+
+(* Main process *)
+process
+    (gcs() | drone() | adversary())

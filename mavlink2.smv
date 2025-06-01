@@ -1,0 +1,160 @@
+-----------------------------------------------------------------
+-- MAVLink-2 DEMO WITH SIMPLE TIMESYNC
+--   one drone, one GCS, one attacker
+--
+--   * attacker forges one HEARTBEAT, then spams CRITICAL_ERROR
+--   * READY allowed only after a TIMESYNC handshake succeeds
+--
+--   clock counters are small integers so BDD build is fast
+-----------------------------------------------------------------
+
+MODULE main
+
+DEFINE
+    STEP_US             := 1;         -- one model step = 1 ms
+    CLK_WRAP            := 1024;      -- wrap interval (value range 0..1023)
+    OFFSET_LIMIT_ACCEPT := 500;       -- accept offset smaller than 500 ms
+
+VAR
+    -------------------------------------------------------------
+    -- protocol state machine
+    -------------------------------------------------------------
+    state : { S_INIT, S_WAIT_HEARTBEAT, S_HANDSHAKE_START,
+              S_SYNC, S_READY, S_MESSAGE_RECEIVED,
+              S_ERROR, S_TIMEOUT };
+
+    -------------------------------------------------------------
+    -- attacker scheduling
+    -------------------------------------------------------------
+    attacker_phase : { PH_IDLE, PH_SPOOF_HB, PH_SPAM_CRIT };
+
+    spoofed_hb       : boolean;   -- forged HEARTBEAT
+    spoofed_critical : boolean;   -- forged CRITICAL_ERROR
+
+    hb_seen   : boolean;
+    crit_seen : boolean;
+
+    -------------------------------------------------------------
+    -- simple timesync
+    -------------------------------------------------------------
+    tsync_state : { TS_IDLE, TS_REQ, TS_WAIT, TS_OK };
+
+    drone_clock : 0..1023;        -- integer range keeps tool fast
+    gcs_clock   : 0..1023;
+    offset      : -1024..1023;    -- signed difference
+
+    attacker_delay_tsync : boolean;
+
+ASSIGN
+    -------------------------------------------------------------
+    -- initial values
+    -------------------------------------------------------------
+    init(state)            := S_INIT;
+    init(attacker_phase)   := PH_IDLE;
+    init(spoofed_hb)       := FALSE;
+    init(spoofed_critical) := FALSE;
+    init(hb_seen)          := FALSE;
+    init(crit_seen)        := FALSE;
+
+    init(tsync_state)      := TS_IDLE;
+    init(drone_clock)      := 0;
+    init(gcs_clock)        := 0;
+    init(offset)           := 0;
+    init(attacker_delay_tsync) := FALSE;
+
+    -------------------------------------------------------------
+    -- attacker behaviour
+    -------------------------------------------------------------
+    next(attacker_phase) := case
+        attacker_phase = PH_IDLE
+            & state = S_WAIT_HEARTBEAT     : PH_SPOOF_HB;
+        attacker_phase = PH_SPOOF_HB       : PH_SPAM_CRIT;
+        TRUE                               : attacker_phase;
+    esac;
+
+    next(spoofed_hb)       := attacker_phase = PH_SPOOF_HB;
+    next(spoofed_critical) := attacker_phase = PH_SPAM_CRIT
+                               & !(state = S_INIT | state = S_TIMEOUT);
+
+    next(hb_seen)   := hb_seen   | spoofed_hb;
+    next(crit_seen) := crit_seen | spoofed_critical;
+
+    -------------------------------------------------------------
+    -- clocks advance with wrap
+    -------------------------------------------------------------
+    next(drone_clock) := (drone_clock + STEP_US) mod CLK_WRAP;
+    next(gcs_clock)   := (gcs_clock   + STEP_US) mod CLK_WRAP;
+
+    -------------------------------------------------------------
+    -- attacker can toggle delay
+    -------------------------------------------------------------
+    next(attacker_delay_tsync) := {TRUE,FALSE};
+
+    -------------------------------------------------------------
+    -- timesync handshake
+    -------------------------------------------------------------
+    next(tsync_state) := case
+        tsync_state = TS_IDLE & state = S_SYNC
+                                         : TS_REQ;
+        tsync_state = TS_REQ  & !attacker_delay_tsync
+                                         : TS_WAIT;
+        tsync_state = TS_WAIT            : TS_OK;
+        TRUE                             : tsync_state;
+    esac;
+
+    next(offset) := case
+        tsync_state = TS_WAIT : (drone_clock - gcs_clock);
+        TRUE                  : offset;
+    esac;
+
+    -------------------------------------------------------------
+    -- protocol transitions
+    -------------------------------------------------------------
+    next(state) := case
+        state = S_INIT                              : S_WAIT_HEARTBEAT;
+        state = S_WAIT_HEARTBEAT & !spoofed_hb      : S_HANDSHAKE_START;
+        state = S_HANDSHAKE_START & !spoofed_hb     : S_SYNC;
+        state = S_SYNC & !spoofed_hb
+                       & tsync_state = TS_OK        : S_READY;
+        state = S_READY & !spoofed_critical         : S_MESSAGE_RECEIVED;
+        state = S_MESSAGE_RECEIVED                  : S_READY;
+
+        (state = S_WAIT_HEARTBEAT
+         | state = S_HANDSHAKE_START
+         | state = S_SYNC) & spoofed_hb             : S_ERROR;
+        state = S_READY & spoofed_critical          : S_ERROR;
+
+        state = S_TIMEOUT | state = S_ERROR         : S_INIT;
+
+        TRUE                                        : state;
+    esac;
+
+-----------------------------------------------------------------
+-- property suite
+-----------------------------------------------------------------
+
+CTLSPEC NAME Critical_Error_Reachable :=
+        EF (state = S_ERROR & spoofed_critical);
+
+CTLSPEC NAME Spoof_After_Ready_Still_Reaches_Error :=
+        AG (state = S_READY ->
+            EF (state = S_ERROR & spoofed_critical));
+
+CTLSPEC NAME Ready_Requires_TimeSync :=
+        AG (state = S_READY -> tsync_state = TS_OK);
+
+CTLSPEC NAME Drone_Reboots_After_Error :=
+        AG ((state = S_ERROR & crit_seen) -> AF state = S_INIT);
+
+LTLSPEC NAME Safety_Violated_By_Spam :=
+        G !(state = S_ERROR & spoofed_critical);
+
+LTLSPEC NAME Spam_Event_Eventually_Error :=
+        G (spoofed_critical -> F state = S_ERROR);
+
+LTLSPEC NAME TimeSync_Eventually_Succeeds_If_Not_Blocked :=
+        G (!attacker_delay_tsync -> F tsync_state = TS_OK);
+
+LTLSPEC NAME Offset_Bounded_After_Sync :=
+        G (tsync_state = TS_OK ->
+           abs(offset) < OFFSET_LIMIT_ACCEPT);
